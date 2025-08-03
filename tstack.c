@@ -13,26 +13,30 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define ENABLE_ARP			1
-#define ENABLE_ICMP			1
-#define ENABLE_ARP_REPLY	1
-#define ENABLE_DEBUG		1
-#define ENABLE_TIMER		1
-#define ENABLE_RINGBUFFER	1
-#define ENABLE_MULTITHREAD	1
-#define ENABLE_UDP_APP		1
+#define ENABLE_ARP					1
+#define ENABLE_ICMP					1
+#define ENABLE_ARP_REPLY			1
+#define ENABLE_DEBUG				1
+#define ENABLE_TIMER				1
+#define ENABLE_RINGBUFFER			1
+#define ENABLE_MULTITHREAD			1
+#define ENABLE_UDP_APP				1
+#define ENABLE_TCP_APP				1
 
-#define RING_SIZE 			1024
-#define NUM_MBUFS 			8191
-#define MBUF_CACHE_SIZE 	250
-#define RX_RING_SIZE 		1024
-#define TX_RING_SIZE 		1024
-#define PKT_BURST 			32
-#define BURST_SIZE			32
+#define RING_SIZE 					1024
+#define NUM_MBUFS 					8191
+#define MBUF_CACHE_SIZE 			250
+#define RX_RING_SIZE 				1024
+#define TX_RING_SIZE 				1024
+#define PKT_BURST 					32
+#define BURST_SIZE					32
+#define TCP_OPTIONAL_LENGTH			10
+#define TCP_MAX_SEQ					4294967295
+#define TCP_RX_WIN					14600
 
 #define UDP_APP_RECV_BUFFER_SIZE	128
 
-#define TIMER_RESOLUTION_CYCLES 60000000000ULL
+#define TIMER_RESOLUTION_CYCLES 	60000000000ULL
 
 #define MAKE_IPV4_ADDR(a, b, c, d) (a + (b<<8) + (c<<16) + (d<<24))
 static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 0, 120);
@@ -110,7 +114,7 @@ static uint16_t checksum(uint16_t *addr, int count) {
 static int fd_counter = DEFAULT_FD_NB;
 
 int get_fd_from_bitmap() {
-	return ++fd_counter;  // 修复：使用递增的fd
+	return ++fd_counter;
 }
 
 struct localhost *
@@ -345,7 +349,6 @@ UDP_process(struct rte_mbuf *mbuf) {
 	
 	struct localhost *host = get_hostinfo_from_ipport(ip_hdr->dst_addr, udp_hdr->dst_port, ip_hdr->next_proto_id);
 	if (host == NULL) {
-		printf("UDP: No host found for IP: 0x%x, port: %d\n", ip_hdr->dst_addr, ntohs(udp_hdr->dst_port));
 		return -3;
 	}
 
@@ -382,7 +385,392 @@ UDP_process(struct rte_mbuf *mbuf) {
 }
 #endif
 
-struct rte_mbuf* encode_udp_app_pktbuf(struct rte_mempool *mbuf_pool,
+
+#if ENABLE_TCP_APP
+
+typedef enum TCP_STATUS {
+
+	TCP_STATUS_CLOSED = 0,
+	TCP_STATUS_LISTEN,
+	TCP_STATUS_SYN_RCVD,
+	TCP_STATUS_SYN_SENT,
+	TCP_STATUS_ESTABLISHED,
+
+	TCP_STATUS_FIN_WAIT_1,
+	TCP_STATUS_FIN_WAIT_2,
+	TCP_STATUS_CLOSING,
+	TCP_STATUS_TIME_WAIT,
+
+	TCP_STATUS_CLOSE_WAIT,
+	TCP_STATUS_LAST_ACK
+
+} TCP_STATUS;
+
+
+
+struct tcp_stream {
+
+	int fd;
+
+	uint32_t sip;
+	uint32_t dip;
+
+	uint16_t sport;
+	uint16_t dport;
+
+	uint16_t proto;
+
+	uint8_t localmac[RTE_ETHER_ADDR_LEN];
+
+	struct rte_ring *sndbuf;
+	struct rte_ring *rcvbuf;
+
+	struct tcp_stream *prev;
+	struct tcp_stream *next;
+
+	TCP_STATUS status;
+	
+	
+	uint32_t snd_nxt; // seqnum
+	uint32_t rcv_nxt; // acknum
+
+};
+
+struct tcp_fragment {
+
+	rte_be16_t sport; /**< TCP source port. */
+	rte_be16_t dport; /**< TCP destination port. */
+	rte_be32_t sent_seq; /**< TX data sequence number. */
+	rte_be32_t recv_ack; /**< RX data acknowledgment sequence number. */
+	uint8_t  data_off;   /**< Data offset. */
+	uint8_t  tcp_flags;  /**< TCP flags */
+	rte_be16_t rx_win;   /**< RX flow control window. */
+	rte_be16_t cksum;    /**< TCP checksum. */
+	rte_be16_t tcp_urp;  /**< TCP urgent pointer, if any. */
+
+	int optlen;
+	uint32_t option[TCP_OPTIONAL_LENGTH];
+
+	unsigned char *data;
+	int length;
+
+};
+
+struct tcp_table {
+	int count;
+	struct tcp_stream *tcp_set;
+};
+
+static struct tcp_table *tInst = NULL;
+static struct tcp_table *tcp_instance() {
+
+	if (tInst == NULL) {
+
+		tInst = rte_malloc("tcp_malloc", sizeof (struct tcp_table), 0);
+		memset(tInst, 0, sizeof (struct tcp_table));
+
+	}
+
+	return tInst;	
+
+}
+
+static struct tcp_stream*
+tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+
+	struct tcp_table *table = tcp_instance();
+
+	struct tcp_stream *iter;
+	for (iter = table->tcp_set; iter != NULL; iter = iter->next) {
+
+		if (iter->dip == dip && iter->sip == sip && iter->dport == dport && iter->sport == sport) {
+
+			return iter;
+		
+		}
+	
+	}
+
+	return NULL;
+
+}
+
+
+static struct tcp_stream*
+tcp_stream_create(uint32_t sip, uint32_t dip, uint8_t sport, uint8_t dport) {
+
+	char stream_name[32];
+	snprintf(stream_name, sizeof(stream_name), "TCPstream_%d", tInst->count);
+	struct tcp_stream *stream = rte_malloc(stream_name, sizeof (struct tcp_stream), 0);
+	
+	stream->dip = dip;
+	stream->sip = sip;
+	stream->dport = dport;
+	stream->sport = sport;
+	stream->fd = get_fd_from_bitmap();
+
+	stream->proto = IPPROTO_TCP;
+	stream->status = TCP_STATUS_LISTEN;
+
+	snprintf(stream_name, sizeof(stream_name), "SNDBUF_%d", tInst->count);
+	stream->sndbuf = rte_ring_create(stream_name, RING_SIZE, rte_socket_id(), 0);
+
+	snprintf(stream_name, sizeof(stream_name), "RCVBUF_%d", tInst->count);
+	stream->rcvbuf = rte_ring_create(stream_name, RING_SIZE, rte_socket_id(), 0);
+
+
+	uint32_t next_seed = time(NULL);
+	stream->snd_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
+
+	rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+	struct tcp_table *table = tcp_instance();
+	LL_ADD(stream, table->tcp_set);
+	
+	return stream;
+
+	
+	
+}
+
+static int
+tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
+
+	if (tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) {
+
+		if (stream->status == TCP_STATUS_LISTEN) {
+
+
+
+			// TODO
+			struct tcp_fragment *fragment = rte_malloc("TTTTODO", sizeof (struct tcp_fragment), 0);
+			if (fragment == NULL) return -1;
+
+			memset(fragment, 0, sizeof (struct tcp_fragment));
+			fragment->sport = tcp_hdr->dst_port;
+			fragment->dport = tcp_hdr->src_port;
+
+			fragment->sent_seq = stream->snd_nxt;
+			fragment->recv_ack = ntohl(tcp_hdr->sent_seq) + 1;
+
+			fragment->tcp_flags = (RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG);
+
+			fragment->rx_win = TCP_RX_WIN;
+			fragment->data_off = 0x50;
+			fragment->data = NULL;
+
+			fragment->length = 0;
+
+			rte_ring_mp_enqueue(stream->sndbuf, fragment);
+			
+			
+			stream->status = TCP_STATUS_SYN_RCVD;
+
+
+		}
+	
+	}
+
+
+	return 0;
+}
+
+static int
+tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
+
+	if (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) {
+
+		if (stream->status == TCP_STATUS_SYN_RCVD) {
+
+			uint32_t ack_num = ntohl(tcp_hdr->recv_ack);
+			if (ack_num == stream->snd_nxt + 1) {
+
+				
+
+			}
+
+			stream->status = TCP_STATUS_ESTABLISHED;
+		}
+
+	}
+
+	
+	return 0;
+}
+
+
+struct rte_mbuf*
+encode_tcp_app_pktbuf(struct rte_mempool *mbuf_pool,
+			uint16_t port_id, uint32_t sip, uint32_t dip, uint16_t sport,
+			uint16_t dport, uint8_t *srcmac, uint8_t *dstmac,
+			struct tcp_fragment *fragment) {
+			
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+		rte_exit(EXIT_FAILURE, "Error: Failed to allocate mbuf\n");
+    }
+
+    // 以太网头部
+    struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
+    rte_memcpy(eth_hdr->dst_addr.addr_bytes, dstmac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth_hdr->src_addr.addr_bytes, srcmac, RTE_ETHER_ADDR_LEN);
+    eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    // IPv4 头部
+    struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+    ip_hdr->version_ihl = 0x45;
+    ip_hdr->type_of_service = 0;
+    ip_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr) + fragment->length);
+    ip_hdr->packet_id = 0;
+    ip_hdr->fragment_offset = 0;
+    ip_hdr->time_to_live = 64;
+    ip_hdr->next_proto_id = IPPROTO_TCP;
+    ip_hdr->src_addr = sip;
+    ip_hdr->dst_addr = dip;
+    ip_hdr->hdr_checksum = 0;
+    ip_hdr->hdr_checksum = checksum((uint16_t *)ip_hdr, sizeof(struct rte_ipv4_hdr));
+
+    // TCP 头部
+    struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
+    tcp_hdr->src_port = fragment->sport;
+    tcp_hdr->dst_port = fragment->dport;
+	tcp_hdr->sent_seq = htonl(fragment->sent_seq);
+	tcp_hdr->recv_ack = htonl(fragment->recv_ack);
+
+	tcp_hdr->data_off = fragment->data_off;
+	tcp_hdr->rx_win = fragment->rx_win;
+	tcp_hdr->tcp_urp = fragment->tcp_urp;
+	tcp_hdr->tcp_flags = fragment->tcp_flags;
+
+
+    // 数据载荷
+	if (fragment->data != NULL) {
+
+	    char *payload = (char *)(tcp_hdr + 1) + fragment->optlen * sizeof (uint32_t);
+    	memcpy(payload, fragment->data, fragment->length);
+
+	}
+
+	tcp_hdr->cksum = 0;
+	tcp_hdr->cksum = rte_ipv4_udptcp_cksum(ip_hdr, tcp_hdr);
+
+    // 设置 mbuf
+    mbuf->data_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
+    				sizeof(struct rte_tcp_hdr) + fragment->length + fragment->optlen + sizeof (uint32_t);
+
+    mbuf->pkt_len = mbuf->data_len;
+	return mbuf;
+}
+
+
+static int
+TCP_OUT(struct rte_mempool *mbuf_pool) {
+
+	struct tcp_table *table = tcp_instance();
+	struct tcp_stream *iter;
+	for (iter = table->tcp_set; iter != NULL; iter = iter->next) {
+
+		struct tcp_fragment *fragment = NULL;
+		int nb_snd = rte_ring_dequeue(iter->sndbuf, (void **)&fragment);
+		if (nb_snd < 0) continue;
+
+		uint8_t *dstmac = get_dst_macaddr(iter->sip);
+
+		if (dstmac == NULL) {
+			struct rte_mbuf *arp_buf = encode_arp_pktmbuf(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, iter->sip, iter->dip);
+			struct inout_ring *ring = ring_instance();
+			rte_ring_mp_enqueue_burst(ring->out, (void **)&arp_buf, 1, NULL);
+			rte_ring_mp_enqueue(iter->sndbuf, fragment);
+		} else {
+
+			struct rte_mbuf *tcp_mbuf = encode_tcp_app_pktbuf(mbuf_pool, gDpdkPortId, iter->dip, iter->sip, iter->sport, iter->dport, iter->localmac, dstmac, fragment);
+			struct inout_ring *ring = ring_instance();
+			rte_ring_mp_enqueue_burst(ring->out, (void **)&tcp_mbuf, 1, NULL);
+
+			rte_free(fragment);
+
+			
+		}
+				
+		
+	}
+	return 0;
+	
+}
+
+static int
+TCP_process(struct rte_mbuf *tcpmbuf) {
+
+	struct rte_ether_hdr *ehdr = rte_pktmbuf_mtod(tcpmbuf, struct rte_ether_hdr *);
+	struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(ehdr + 1);
+	struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
+
+	uint16_t cksum = rte_ipv4_udptcp_cksum(ip_hdr, tcp_hdr);
+
+	if (cksum != ntohs(tcp_hdr->cksum)) {
+		return -1;
+	}
+
+	
+	struct tcp_stream *stream = tcp_stream_search(ip_hdr->src_addr, ip_hdr->dst_addr,
+	tcp_hdr->src_port, tcp_hdr->dst_port);
+
+	if (stream == NULL) {
+		stream = tcp_stream_create(ip_hdr->src_addr, ip_hdr->dst_addr, tcp_hdr->src_port, tcp_hdr->dst_port);		
+		if (stream == NULL) return -2;
+	}
+
+	printf("==> TCP_process\n");
+
+
+	switch (stream->status) {
+
+		case TCP_STATUS_CLOSED:
+			break;
+				
+		case TCP_STATUS_LISTEN:
+			tcp_handle_listen(stream, tcp_hdr);
+			break;
+		
+		case TCP_STATUS_SYN_RCVD:
+			tcp_handle_syn_rcvd(stream, tcp_hdr);
+			break;
+		
+		case TCP_STATUS_SYN_SENT:
+			break;
+
+		case TCP_STATUS_ESTABLISHED:
+			break;
+		
+		case TCP_STATUS_FIN_WAIT_1:
+			break;
+		
+		case TCP_STATUS_FIN_WAIT_2:
+			break;
+				
+		case TCP_STATUS_CLOSING:
+			break;
+		
+		case TCP_STATUS_TIME_WAIT:
+			break;
+		
+		case TCP_STATUS_CLOSE_WAIT:
+			break;
+		
+		case TCP_STATUS_LAST_ACK:
+			break;
+		
+
+	}
+
+}
+
+
+#endif
+
+
+
+struct rte_mbuf*
+encode_udp_app_pktbuf(struct rte_mempool *mbuf_pool,
 			uint16_t port_id, uint32_t sip, uint32_t dip, uint16_t sport,
 			uint16_t dport, uint8_t *srcmac, uint8_t *dstmac,
 			const char *data, int len) {
@@ -429,9 +817,9 @@ struct rte_mbuf* encode_udp_app_pktbuf(struct rte_mempool *mbuf_pool,
 	return mbuf;
 }
 
-int
+static int
 UDP_OUT(struct rte_mempool *mbuf_pool) {
-	struct 	localhost *host;
+	struct localhost *host;
 	for (host = lhost; host != NULL; host = host->next) {
 		struct offload *ol;
 		int nb_snd = rte_ring_mc_dequeue(host->sndbuf, (void **)&ol);
@@ -467,7 +855,13 @@ packet_process(__rte_unused void *arg)
 
 	while (1) {
 		// 处理输出队列
+
+#if ENABLE_UDP_APP
 		UDP_OUT(mbuf_pool);
+#endif
+#if ENABLE_TCP_APP
+		TCP_OUT(mbuf_pool);
+#endif
 
 		struct rte_mbuf* mbufs[BURST_SIZE];
 		unsigned nb_rx = rte_ring_mc_dequeue_burst(ring->in, (void **)mbufs, BURST_SIZE, NULL); 
@@ -540,8 +934,17 @@ packet_process(__rte_unused void *arg)
 				struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(ehdr + 1);
 				
 		   		if (ip_hdr->next_proto_id == IPPROTO_UDP) {
+					printf("UDP ===> \n");
 					UDP_process(mbufs[i]);
 				}
+
+#if ENABLE_TCP_APP
+
+				else if (ip_hdr->next_proto_id == IPPROTO_TCP) {
+					TCP_process(mbufs[i]);
+				}
+
+#endif
 
 #if ENABLE_ICMP
 				else if (ip_hdr->next_proto_id == IPPROTO_ICMP) {
@@ -586,7 +989,6 @@ static int nsocket(int domain, int type, int protocol) {
 	else if (type == SOCK_STREAM)
 		host->protocol = IPPROTO_TCP;
 
-	// 修复：为每个socket创建唯一的ring名称
 	char ring_name[32];
 	snprintf(ring_name, sizeof(ring_name), "rcvbuf_%d", fd);
 	host->rcvbuf = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
@@ -645,8 +1047,8 @@ static ssize_t nrecvfrom(int sockfd, void* buf, size_t len,
 	pthread_mutex_unlock(&host->mutex);
 	
 	struct sockaddr_in *saddr = (struct sockaddr_in *)_src_addr;
-	saddr->sin_port = ol->sport;  // 修复：使用源端口
-	rte_memcpy(&saddr->sin_addr.s_addr, &ol->sip, sizeof (uint32_t));  // 修复：使用源IP
+	saddr->sin_port = ol->sport;
+	rte_memcpy(&saddr->sin_addr.s_addr, &ol->sip, sizeof (uint32_t));
 	
 	if (len < ol->length) {
 		rte_memcpy(buf, ol->data, len);
@@ -660,13 +1062,13 @@ static ssize_t nrecvfrom(int sockfd, void* buf, size_t len,
 		rte_ring_mp_enqueue(host->rcvbuf, ol);
 		return len;
 	} else {
-		rte_memcpy(buf, ol->data, ol->length);  // 修复：复制实际数据
+		rte_memcpy(buf, ol->data, ol->length);
 		int ret_len = ol->length;
 
 		rte_free(ol->data);
 		rte_free(ol);
 		
-		return ret_len;  // 修复：返回实际长度
+		return ret_len;
 	}
 }
 
@@ -723,7 +1125,7 @@ int udp_server_entry(void *argv) {
 	struct sockaddr_in localaddr, clientaddr;
 	memset(&localaddr, 0, sizeof (struct sockaddr_in));
 
-	localaddr.sin_port = htons(8081);
+	localaddr.sin_port = htons(8888);
 	localaddr.sin_family = AF_INET;
 	localaddr.sin_addr.s_addr = inet_addr("192.168.0.120");
 
@@ -752,6 +1154,8 @@ int udp_server_entry(void *argv) {
 }
 #endif
 
+
+
 int main(int argc, char *argv[]) {
     int ret;
     unsigned int lcore_id;
@@ -778,7 +1182,7 @@ int main(int argc, char *argv[]) {
 
     // 设置 IP 和端口
 	gSrcIp = gLocalIp;
-    gSrcPort = rte_cpu_to_be_16(8088);
+    gSrcPort = rte_cpu_to_be_16(8888);
 
 // 初始化定时器
 #if ENABLE_TIMER
