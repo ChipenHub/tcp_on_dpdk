@@ -36,7 +36,7 @@
 
 #define UDP_APP_RECV_BUFFER_SIZE	128
 
-#define TIMER_RESOLUTION_CYCLES 	60000000000ULL
+#define TIMER_RESOLUTION_CYCLES 	180000000000ULL
 
 #define MAKE_IPV4_ADDR(a, b, c, d) (a + (b<<8) + (c<<16) + (d<<24))
 static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 0, 120);
@@ -384,12 +384,42 @@ UDP_process(struct rte_mbuf *mbuf) {
 	return 0;
 }
 #endif
+/*
+==> TCP_process: flags=0x02, status=1
+TCP LISTEN: Received SYN, sending SYN+ACK
+TCP: Status changed to SYN_RCVD
+==> TCP_process: flags=0x10, status=2
+TCP SYN_RCVD: Received final ACK, connection established
+TCP: Status changed to ESTABLISHED
 
+==> TCP_process: flags=0x18, status=4
+TCP ESTABLISHED: Processing packet
+TCP: Received data, sending ACK
 
+==> TCP_process: flags=0x18, status=4
+TCP ESTABLISHED: Processing packet
+TCP: Received data, sending ACK
+
+==> TCP_process: flags=0x18, status=4
+TCP ESTABLISHED: Processing packet
+TCP: Received data, sending ACK
+
+==> TCP_process: flags=0x18, status=4
+TCP ESTABLISHED: Processing packet
+TCP: Received data, sending ACK
+
+==> TCP_process: flags=0x18, status=4
+TCP ESTABLISHED: Processing packet
+TCP: Received data, sending ACK
+
+==> TCP_process: flags=0x11, status=4
+TCP ESTABLISHED: Processing packet
+TCP: Received data, sending ACK
+
+*/
 #if ENABLE_TCP_APP
 
 typedef enum TCP_STATUS {
-
 	TCP_STATUS_CLOSED = 0,
 	TCP_STATUS_LISTEN,
 	TCP_STATUS_SYN_RCVD,
@@ -406,10 +436,7 @@ typedef enum TCP_STATUS {
 
 } TCP_STATUS;
 
-
-
 struct tcp_stream {
-
 	int fd;
 
 	uint32_t sip;
@@ -430,14 +457,11 @@ struct tcp_stream {
 
 	TCP_STATUS status;
 	
-	
 	uint32_t snd_nxt; // seqnum
 	uint32_t rcv_nxt; // acknum
-
 };
 
 struct tcp_fragment {
-
 	rte_be16_t sport; /**< TCP source port. */
 	rte_be16_t dport; /**< TCP destination port. */
 	rte_be32_t sent_seq; /**< TX data sequence number. */
@@ -453,7 +477,6 @@ struct tcp_fragment {
 
 	unsigned char *data;
 	int length;
-
 };
 
 struct tcp_table {
@@ -463,45 +486,34 @@ struct tcp_table {
 
 static struct tcp_table *tInst = NULL;
 static struct tcp_table *tcp_instance() {
-
 	if (tInst == NULL) {
-
 		tInst = rte_malloc("tcp_malloc", sizeof (struct tcp_table), 0);
 		memset(tInst, 0, sizeof (struct tcp_table));
-
 	}
-
 	return tInst;	
-
 }
 
 static struct tcp_stream*
 tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
-
 	struct tcp_table *table = tcp_instance();
 
 	struct tcp_stream *iter;
 	for (iter = table->tcp_set; iter != NULL; iter = iter->next) {
-
 		if (iter->dip == dip && iter->sip == sip && iter->dport == dport && iter->sport == sport) {
-
 			return iter;
-		
 		}
-	
 	}
-
 	return NULL;
-
 }
 
-
 static struct tcp_stream*
-tcp_stream_create(uint32_t sip, uint32_t dip, uint8_t sport, uint8_t dport) {
-
+tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+	struct tcp_table *table = tcp_instance();
+	
 	char stream_name[32];
-	snprintf(stream_name, sizeof(stream_name), "TCPstream_%d", tInst->count);
+	snprintf(stream_name, sizeof(stream_name), "TCPstream_%d", table->count);
 	struct tcp_stream *stream = rte_malloc(stream_name, sizeof (struct tcp_stream), 0);
+	if (stream == NULL) return NULL;
 	
 	stream->dip = dip;
 	stream->sip = sip;
@@ -512,91 +524,131 @@ tcp_stream_create(uint32_t sip, uint32_t dip, uint8_t sport, uint8_t dport) {
 	stream->proto = IPPROTO_TCP;
 	stream->status = TCP_STATUS_LISTEN;
 
-	snprintf(stream_name, sizeof(stream_name), "SNDBUF_%d", tInst->count);
+	snprintf(stream_name, sizeof(stream_name), "SNDBUF_%d", table->count);
 	stream->sndbuf = rte_ring_create(stream_name, RING_SIZE, rte_socket_id(), 0);
 
-	snprintf(stream_name, sizeof(stream_name), "RCVBUF_%d", tInst->count);
+	snprintf(stream_name, sizeof(stream_name), "RCVBUF_%d", table->count);
 	stream->rcvbuf = rte_ring_create(stream_name, RING_SIZE, rte_socket_id(), 0);
-
 
 	uint32_t next_seed = time(NULL);
 	stream->snd_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
+	stream->rcv_nxt = 0;
 
 	rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
-	struct tcp_table *table = tcp_instance();
-	LL_ADD(stream, table->tcp_set);
+	
+	// 使用新版本DPDK的LL_ADD宏
+	stream->prev = NULL;
+	stream->next = table->tcp_set;
+	if (table->tcp_set != NULL) table->tcp_set->prev = stream;
+	table->tcp_set = stream;
+	
+	table->count++;
 	
 	return stream;
-
-	
-	
 }
 
 static int
 tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
-
 	if (tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) {
-
 		if (stream->status == TCP_STATUS_LISTEN) {
-
-
-
-			// TODO
-			struct tcp_fragment *fragment = rte_malloc("TTTTODO", sizeof (struct tcp_fragment), 0);
+			
+			printf("TCP LISTEN: Received SYN, sending SYN+ACK\n");
+			
+			struct tcp_fragment *fragment = rte_malloc("tcp_fragment", sizeof (struct tcp_fragment), 0);
 			if (fragment == NULL) return -1;
 
 			memset(fragment, 0, sizeof (struct tcp_fragment));
+			
+			// 修复端口设置：回复时源端口和目标端口要交换
 			fragment->sport = tcp_hdr->dst_port;
 			fragment->dport = tcp_hdr->src_port;
 
-			fragment->sent_seq = stream->snd_nxt;
-			fragment->recv_ack = ntohl(tcp_hdr->sent_seq) + 1;
+			fragment->sent_seq = htonl(stream->snd_nxt);
+			fragment->recv_ack = htonl(ntohl(tcp_hdr->sent_seq) + 1);
+			
+			// 更新接收序号
+			stream->rcv_nxt = ntohl(tcp_hdr->sent_seq) + 1;
 
 			fragment->tcp_flags = (RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG);
-
-			fragment->rx_win = TCP_RX_WIN;
+			fragment->rx_win = htons(TCP_RX_WIN);
 			fragment->data_off = 0x50;
 			fragment->data = NULL;
-
 			fragment->length = 0;
+			fragment->optlen = 0;
 
 			rte_ring_mp_enqueue(stream->sndbuf, fragment);
 			
-			
 			stream->status = TCP_STATUS_SYN_RCVD;
-
-
+			
+			printf("TCP: Status changed to SYN_RCVD\n");
 		}
-	
 	}
-
-
 	return 0;
 }
 
 static int
 tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
-
 	if (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) {
-
 		if (stream->status == TCP_STATUS_SYN_RCVD) {
-
 			uint32_t ack_num = ntohl(tcp_hdr->recv_ack);
 			if (ack_num == stream->snd_nxt + 1) {
-
 				
-
+				printf("TCP SYN_RCVD: Received final ACK, connection established\n");
+				
+				// 更新发送序号
+				stream->snd_nxt++;
+				stream->status = TCP_STATUS_ESTABLISHED;
+				
+				printf("TCP: Status changed to ESTABLISHED\n");
 			}
-
-			stream->status = TCP_STATUS_ESTABLISHED;
 		}
-
 	}
-
-	
 	return 0;
 }
 
+static int
+tcp_handle_established(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
+	printf("TCP ESTABLISHED: Processing packet\n");
+	
+	// 处理数据包
+	uint8_t hdrlen = (tcp_hdr->data_off >> 4) * 4;
+	if (hdrlen < sizeof(struct rte_tcp_hdr)) {
+		printf("Invalid TCP header length: %d\n", hdrlen);
+		return -1;
+	}
+	
+	// 计算数据载荷长度 - 需要从IP头获取总长度
+	// 这里暂时简化处理
+	uint8_t *payload = (uint8_t *)tcp_hdr + hdrlen;
+	
+	// 如果有数据，发送ACK
+	if (tcp_hdr->tcp_flags & RTE_TCP_PSH_FLAG || tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) {
+		printf("TCP: Received data, sending ACK\n");
+		
+		struct tcp_fragment *fragment = rte_malloc("tcp_fragment", sizeof (struct tcp_fragment), 0);
+		if (fragment == NULL) return -1;
+
+		memset(fragment, 0, sizeof (struct tcp_fragment));
+		
+		fragment->sport = tcp_hdr->dst_port;
+		fragment->dport = tcp_hdr->src_port;
+		fragment->sent_seq = htonl(stream->snd_nxt);
+		fragment->recv_ack = htonl(ntohl(tcp_hdr->sent_seq) + 1);
+		fragment->tcp_flags = RTE_TCP_ACK_FLAG;
+		fragment->rx_win = htons(TCP_RX_WIN);
+		fragment->data_off = 0x50;
+		fragment->data = NULL;
+		fragment->length = 0;
+		fragment->optlen = 0;
+
+		rte_ring_mp_enqueue(stream->sndbuf, fragment);
+		
+		// 更新接收序号
+		stream->rcv_nxt = ntohl(tcp_hdr->sent_seq) + 1;
+	}
+	
+	return 0;
+}
 
 struct rte_mbuf*
 encode_tcp_app_pktbuf(struct rte_mempool *mbuf_pool,
@@ -609,6 +661,10 @@ encode_tcp_app_pktbuf(struct rte_mempool *mbuf_pool,
 		rte_exit(EXIT_FAILURE, "Error: Failed to allocate mbuf\n");
     }
 
+    // 计算总长度
+    uint32_t total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + 
+                         sizeof(struct rte_tcp_hdr) + fragment->optlen * sizeof(uint32_t) + fragment->length;
+
     // 以太网头部
     struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
     rte_memcpy(eth_hdr->dst_addr.addr_bytes, dstmac, RTE_ETHER_ADDR_LEN);
@@ -619,7 +675,8 @@ encode_tcp_app_pktbuf(struct rte_mempool *mbuf_pool,
     struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
     ip_hdr->version_ihl = 0x45;
     ip_hdr->type_of_service = 0;
-    ip_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr) + fragment->length);
+    ip_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr) + 
+                                           fragment->optlen * sizeof(uint32_t) + fragment->length);
     ip_hdr->packet_id = 0;
     ip_hdr->fragment_offset = 0;
     ip_hdr->time_to_live = 64;
@@ -627,44 +684,37 @@ encode_tcp_app_pktbuf(struct rte_mempool *mbuf_pool,
     ip_hdr->src_addr = sip;
     ip_hdr->dst_addr = dip;
     ip_hdr->hdr_checksum = 0;
-    ip_hdr->hdr_checksum = checksum((uint16_t *)ip_hdr, sizeof(struct rte_ipv4_hdr));
+    ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
     // TCP 头部
     struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
     tcp_hdr->src_port = fragment->sport;
     tcp_hdr->dst_port = fragment->dport;
-	tcp_hdr->sent_seq = htonl(fragment->sent_seq);
-	tcp_hdr->recv_ack = htonl(fragment->recv_ack);
+	tcp_hdr->sent_seq = fragment->sent_seq;
+	tcp_hdr->recv_ack = fragment->recv_ack;
 
 	tcp_hdr->data_off = fragment->data_off;
 	tcp_hdr->rx_win = fragment->rx_win;
 	tcp_hdr->tcp_urp = fragment->tcp_urp;
 	tcp_hdr->tcp_flags = fragment->tcp_flags;
 
-
     // 数据载荷
-	if (fragment->data != NULL) {
-
-	    char *payload = (char *)(tcp_hdr + 1) + fragment->optlen * sizeof (uint32_t);
-    	memcpy(payload, fragment->data, fragment->length);
-
+	if (fragment->data != NULL && fragment->length > 0) {
+	    char *payload = (char *)(tcp_hdr + 1) + fragment->optlen * sizeof(uint32_t);
+    	rte_memcpy(payload, fragment->data, fragment->length);
 	}
 
 	tcp_hdr->cksum = 0;
 	tcp_hdr->cksum = rte_ipv4_udptcp_cksum(ip_hdr, tcp_hdr);
 
     // 设置 mbuf
-    mbuf->data_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) +
-    				sizeof(struct rte_tcp_hdr) + fragment->length + fragment->optlen + sizeof (uint32_t);
-
+    mbuf->data_len = total_len;
     mbuf->pkt_len = mbuf->data_len;
 	return mbuf;
 }
 
-
 static int
 TCP_OUT(struct rte_mempool *mbuf_pool) {
-
 	struct tcp_table *table = tcp_instance();
 	struct tcp_stream *iter;
 	for (iter = table->tcp_set; iter != NULL; iter = iter->next) {
@@ -676,54 +726,54 @@ TCP_OUT(struct rte_mempool *mbuf_pool) {
 		uint8_t *dstmac = get_dst_macaddr(iter->sip);
 
 		if (dstmac == NULL) {
-			struct rte_mbuf *arp_buf = encode_arp_pktmbuf(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, iter->sip, iter->dip);
+			struct rte_mbuf *arp_buf = encode_arp_pktmbuf(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, iter->dip, iter->sip);
 			struct inout_ring *ring = ring_instance();
 			rte_ring_mp_enqueue_burst(ring->out, (void **)&arp_buf, 1, NULL);
 			rte_ring_mp_enqueue(iter->sndbuf, fragment);
 		} else {
-
-			struct rte_mbuf *tcp_mbuf = encode_tcp_app_pktbuf(mbuf_pool, gDpdkPortId, iter->dip, iter->sip, iter->sport, iter->dport, iter->localmac, dstmac, fragment);
+			struct rte_mbuf *tcp_mbuf = encode_tcp_app_pktbuf(mbuf_pool, gDpdkPortId, iter->dip, iter->sip, 
+				iter->sport, iter->dport, iter->localmac, dstmac, fragment);
 			struct inout_ring *ring = ring_instance();
 			rte_ring_mp_enqueue_burst(ring->out, (void **)&tcp_mbuf, 1, NULL);
 
 			rte_free(fragment);
-
-			
 		}
-				
-		
 	}
 	return 0;
-	
 }
 
 static int
 TCP_process(struct rte_mbuf *tcpmbuf) {
-
 	struct rte_ether_hdr *ehdr = rte_pktmbuf_mtod(tcpmbuf, struct rte_ether_hdr *);
 	struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(ehdr + 1);
 	struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
 
-	uint16_t cksum = rte_ipv4_udptcp_cksum(ip_hdr, tcp_hdr);
+	// 校验TCP校验和
+	uint16_t original_cksum = tcp_hdr->cksum;
+	tcp_hdr->cksum = 0;
+	uint16_t calculated_cksum = rte_ipv4_udptcp_cksum(ip_hdr, tcp_hdr);
+	tcp_hdr->cksum = original_cksum;
 
-	if (cksum != ntohs(tcp_hdr->cksum)) {
+	if (calculated_cksum != original_cksum) {
+		printf("TCP checksum error: calculated=%04x, received=%04x\n", calculated_cksum, original_cksum);
+		rte_pktmbuf_free(tcpmbuf);
 		return -1;
 	}
 
-	
 	struct tcp_stream *stream = tcp_stream_search(ip_hdr->src_addr, ip_hdr->dst_addr,
-	tcp_hdr->src_port, tcp_hdr->dst_port);
+		tcp_hdr->src_port, tcp_hdr->dst_port);
 
 	if (stream == NULL) {
 		stream = tcp_stream_create(ip_hdr->src_addr, ip_hdr->dst_addr, tcp_hdr->src_port, tcp_hdr->dst_port);		
-		if (stream == NULL) return -2;
+		if (stream == NULL) {
+			rte_pktmbuf_free(tcpmbuf);
+			return -2;
+		}
 	}
 
-	printf("==> TCP_process\n");
-
+	printf("==> TCP_process: flags=0x%02x, status=%d\n", tcp_hdr->tcp_flags, stream->status);
 
 	switch (stream->status) {
-
 		case TCP_STATUS_CLOSED:
 			break;
 				
@@ -739,6 +789,7 @@ TCP_process(struct rte_mbuf *tcpmbuf) {
 			break;
 
 		case TCP_STATUS_ESTABLISHED:
+			tcp_handle_established(stream, tcp_hdr);
 			break;
 		
 		case TCP_STATUS_FIN_WAIT_1:
@@ -758,16 +809,13 @@ TCP_process(struct rte_mbuf *tcpmbuf) {
 		
 		case TCP_STATUS_LAST_ACK:
 			break;
-		
-
 	}
 
+	rte_pktmbuf_free(tcpmbuf);
+	return 0;
 }
 
-
 #endif
-
-
 
 struct rte_mbuf*
 encode_udp_app_pktbuf(struct rte_mempool *mbuf_pool,
@@ -855,7 +903,6 @@ packet_process(__rte_unused void *arg)
 
 	while (1) {
 		// 处理输出队列
-
 #if ENABLE_UDP_APP
 		UDP_OUT(mbuf_pool);
 #endif
@@ -882,16 +929,16 @@ packet_process(__rte_unused void *arg)
 				if (ahdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
 					struct in_addr addr;
 					addr.s_addr = ahdr->arp_data.arp_sip;
-					printf("arp ---> src: %s", inet_ntoa(addr));
+					// printf("arp ---> src: %s", inet_ntoa(addr));
 
 					addr.s_addr = ahdr->arp_data.arp_tip;
-					printf("  local: %s\n", inet_ntoa(addr));
+					// printf("  local: %s\n", inet_ntoa(addr));
 
 					struct rte_mbuf *arpbuf = encode_arp_pktmbuf(mbuf_pool, RTE_ARP_OP_REPLY, ahdr->arp_data.arp_sha.addr_bytes,
 						ahdr->arp_data.arp_tip, ahdr->arp_data.arp_sip);
 					
 					rte_ring_mp_enqueue_burst(ring->out, (void **)&arpbuf, 1, NULL);
-					printf("ARP enqueue finished\n");
+					// printf("ARP enqueue finished\n");
 
 					rte_pktmbuf_free(mbufs[i]);
 					continue;
@@ -910,17 +957,21 @@ packet_process(__rte_unused void *arg)
 							rte_memcpy(entry->hwaddr, ahdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
 							entry->status = ARP_ENTRY_STATIC_DYNAMIC;
 
-							LL_ADD(entry, table->entries);
+							// 使用新版本DPDK的LL_ADD宏
+							entry->prev = NULL;
+							entry->next = table->entries;
+							if (table->entries != NULL) table->entries->prev = entry;
+							table->entries = entry;
 							table->count++;
 						}
 					}
 #if ENABLE_DEBUG
 					struct arp_entry *iter;
 					for (iter = table->entries; iter != NULL; iter = iter->next) {
-						print_ether_addr("arp entry ---> mac: ", (struct rte_ether_addr *) iter->hwaddr);
+						// print_ether_addr("arp entry ---> mac: ", (struct rte_ether_addr *) iter->hwaddr);
 						struct in_addr addr;
 						addr.s_addr = iter->ip;
-						printf(" ---> src: %s\n", inet_ntoa(addr));
+						// printf(" ---> src: %s\n", inet_ntoa(addr));
 					}
 #endif
 				}
@@ -934,16 +985,13 @@ packet_process(__rte_unused void *arg)
 				struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(ehdr + 1);
 				
 		   		if (ip_hdr->next_proto_id == IPPROTO_UDP) {
-					printf("UDP ===> \n");
 					UDP_process(mbufs[i]);
 				}
 
 #if ENABLE_TCP_APP
-
 				else if (ip_hdr->next_proto_id == IPPROTO_TCP) {
 					TCP_process(mbufs[i]);
 				}
-
 #endif
 
 #if ENABLE_ICMP
@@ -961,6 +1009,8 @@ packet_process(__rte_unused void *arg)
 							ip_hdr->dst_addr, ip_hdr->src_addr, icmphdr->icmp_ident, icmphdr->icmp_seq_nb);
 
 						rte_ring_mp_enqueue_burst(ring->out, (void **)&txbuf, 1, NULL);
+						rte_pktmbuf_free(mbufs[i]);
+					} else {
 						rte_pktmbuf_free(mbufs[i]);
 					}
 				}
@@ -1011,7 +1061,11 @@ static int nsocket(int domain, int type, int protocol) {
 	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
 	rte_memcpy(&host->mutex, &blank_mutex, sizeof (pthread_mutex_t));
 	
-	LL_ADD(host, lhost);
+	// 使用新版本DPDK的LL_ADD宏
+	host->prev = NULL;
+	host->next = lhost;
+	if (lhost != NULL) lhost->prev = host;
+	lhost = host;
 
 	return fd;
 }
@@ -1105,7 +1159,11 @@ static int nclose(int fd) {
 	struct localhost *host = get_hostinfo_from_fd(fd);
 	if (host == NULL) return -1;
 
-	LL_REMOVE(host, lhost);
+	// 使用新版本DPDK的LL_REMOVE宏
+	if (host->prev != NULL) host->prev->next = host->next;
+	if (host->next != NULL) host->next->prev = host->prev;
+	if (lhost == host) lhost = host->next;
+	host->prev = host->next = NULL;
 
 	if (host->rcvbuf) rte_ring_free(host->rcvbuf);
 	if (host->sndbuf) rte_ring_free(host->sndbuf);
@@ -1153,8 +1211,6 @@ int udp_server_entry(void *argv) {
 	return 0;
 }
 #endif
-
-
 
 int main(int argc, char *argv[]) {
     int ret;
@@ -1250,6 +1306,8 @@ int main(int argc, char *argv[]) {
 				rte_pktmbuf_free(tx[i]);
 			}
 		}
+
+
 
 #if ENABLE_TIMER
 		static uint64_t prev_tsc = 0, cur_tsc;
