@@ -305,7 +305,7 @@ arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim, void *arg) {
 		return;
 	}
 
-	printf("arp_request ---> ");
+// 	printf("arp_request ---> ");
 
 	int i = 0; 
 	for (i = 1; i < 255; i++) {
@@ -314,7 +314,7 @@ arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim, void *arg) {
 
 		struct in_addr addr;
 		addr.s_addr = dstip;
-		printf("%s ", inet_ntoa(addr));
+//		printf("%s ", inet_ntoa(addr));
 
 		struct rte_mbuf * arp_buf = encode_arp_pktmbuf(mbuf_pool, RTE_ARP_OP_REQUEST, dstmac, gLocalIp, dstip);
 		if (arp_buf != NULL) {
@@ -324,7 +324,7 @@ arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim, void *arg) {
 			}
 		}
 	}
-	puts("");
+//	puts("");
 }
 #endif
 
@@ -384,6 +384,7 @@ UDP_process(struct rte_mbuf *mbuf) {
 	return 0;
 }
 #endif
+
 /*
 ==> TCP_process: flags=0x02, status=1
 TCP LISTEN: Received SYN, sending SYN+ACK
@@ -417,6 +418,7 @@ TCP ESTABLISHED: Processing packet
 TCP: Received data, sending ACK
 
 */
+
 #if ENABLE_TCP_APP
 
 typedef enum TCP_STATUS {
@@ -587,7 +589,7 @@ tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
 }
 
 static int
-tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
+tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr, int tcplen) {
 	if (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) {
 		if (stream->status == TCP_STATUS_SYN_RCVD) {
 			uint32_t ack_num = ntohl(tcp_hdr->recv_ack);
@@ -605,50 +607,98 @@ tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
 	}
 	return 0;
 }
-
+/// 完整的 tcp_handle_established，带严格序号校验、单独 ACK 和 echo 返回数据
 static int
-tcp_handle_established(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
-	printf("TCP ESTABLISHED: Processing packet\n");
-	
-	// 处理数据包
-	uint8_t hdrlen = (tcp_hdr->data_off >> 4) * 4;
-	if (hdrlen < sizeof(struct rte_tcp_hdr)) {
-		printf("Invalid TCP header length: %d\n", hdrlen);
-		return -1;
-	}
-	
-	// 计算数据载荷长度 - 需要从IP头获取总长度
-	// 这里暂时简化处理
-	uint8_t *payload = (uint8_t *)tcp_hdr + hdrlen;
-	
-	// 如果有数据，发送ACK
-	if (tcp_hdr->tcp_flags & RTE_TCP_PSH_FLAG || tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) {
-		printf("TCP: Received data, sending ACK\n");
-		
-		struct tcp_fragment *fragment = rte_malloc("tcp_fragment", sizeof (struct tcp_fragment), 0);
-		if (fragment == NULL) return -1;
+tcp_handle_established(struct tcp_stream *stream,
+                       struct rte_tcp_hdr *tcp_hdr,
+                       int tcplen)
+{
+    // 1. 解析序号与载荷长度
+    uint32_t seg_seq     = ntohl(tcp_hdr->sent_seq);
+    uint8_t  hdr_len     = (tcp_hdr->data_off >> 4) * 4;
+    int      payload_len = tcplen - hdr_len;
 
-		memset(fragment, 0, sizeof (struct tcp_fragment));
-		
-		fragment->sport = tcp_hdr->dst_port;
-		fragment->dport = tcp_hdr->src_port;
-		fragment->sent_seq = htonl(stream->snd_nxt);
-		fragment->recv_ack = htonl(ntohl(tcp_hdr->sent_seq) + 1);
-		fragment->tcp_flags = RTE_TCP_ACK_FLAG;
-		fragment->rx_win = htons(TCP_RX_WIN);
-		fragment->data_off = 0x50;
-		fragment->data = NULL;
-		fragment->length = 0;
-		fragment->optlen = 0;
+    // 2. 丢弃或 Dup-ACK 乱序包
+    if (seg_seq != stream->rcv_nxt) {
+        struct tcp_fragment *dup_ack = rte_malloc(NULL, sizeof(*dup_ack), 0);
+        if (!dup_ack) return -1;
+        memset(dup_ack, 0, sizeof(*dup_ack));
+        dup_ack->sport     = tcp_hdr->dst_port;
+        dup_ack->dport     = tcp_hdr->src_port;
+        dup_ack->sent_seq  = htonl(stream->snd_nxt);
+        dup_ack->recv_ack  = htonl(stream->rcv_nxt);
+        dup_ack->tcp_flags = RTE_TCP_ACK_FLAG;
+        dup_ack->rx_win    = htons(TCP_RX_WIN);
+        dup_ack->data_off  = 0x50;
+        rte_ring_mp_enqueue(stream->sndbuf, dup_ack);
+        return 0;
+    }
 
-		rte_ring_mp_enqueue(stream->sndbuf, fragment);
-		
-		// 更新接收序号
-		stream->rcv_nxt = ntohl(tcp_hdr->sent_seq) + 1;
-	}
-	
-	return 0;
+    // 3. 接收并缓存有效载荷
+    unsigned char *payload = (unsigned char*)tcp_hdr + hdr_len;
+    if (payload_len > 0) {
+        struct tcp_fragment *rfrag = rte_malloc(NULL, sizeof(*rfrag), 0);
+        if (!rfrag) return -1;
+        memset(rfrag, 0, sizeof(*rfrag));
+        rfrag->sport     = tcp_hdr->dst_port;
+        rfrag->dport     = tcp_hdr->src_port;
+        rfrag->sent_seq  = htonl(stream->snd_nxt);
+        rfrag->recv_ack  = htonl(stream->rcv_nxt + payload_len);
+        rfrag->tcp_flags = RTE_TCP_PSH_FLAG;
+        rfrag->rx_win    = htons(TCP_RX_WIN);
+        rfrag->data_off  = 0x50;
+        rfrag->data      = rte_malloc(NULL, payload_len, 0);
+        if (!rfrag->data) { rte_free(rfrag); return -1; }
+        rte_memcpy(rfrag->data, payload, payload_len);
+        rfrag->length    = payload_len;
+        rte_ring_mp_enqueue(stream->rcvbuf, rfrag);
+
+        // 推进接收序号
+        stream->rcv_nxt += payload_len;
+    }
+
+    // 4. 构造并发送单独 ACK
+    struct tcp_fragment *ack = rte_malloc(NULL, sizeof(*ack), 0);
+    if (!ack) return -1;
+    memset(ack, 0, sizeof(*ack));
+    ack->sport     = tcp_hdr->dst_port;
+    ack->dport     = tcp_hdr->src_port;
+    ack->sent_seq  = htonl(stream->snd_nxt);
+    ack->recv_ack  = htonl(stream->rcv_nxt);
+    ack->tcp_flags = RTE_TCP_ACK_FLAG;
+    ack->rx_win    = htons(TCP_RX_WIN);
+    ack->data_off  = 0x50;
+    rte_ring_mp_enqueue(stream->sndbuf, ack);
+
+    // 5. echo: 构造并发送带数据的 PSH+ACK
+    if (payload_len > 0) {
+        struct tcp_fragment *echo = rte_malloc(NULL, sizeof(*echo), 0);
+        if (!echo) return -1;
+        memset(echo, 0, sizeof(*echo));
+        echo->sport     = tcp_hdr->dst_port;
+        echo->dport     = tcp_hdr->src_port;
+        // 使用当前 snd_nxt 作为 seq
+        echo->sent_seq  = htonl(stream->snd_nxt);
+        echo->recv_ack  = htonl(stream->rcv_nxt);
+        echo->tcp_flags = RTE_TCP_PSH_FLAG | RTE_TCP_ACK_FLAG;
+        echo->rx_win    = htons(TCP_RX_WIN);
+        echo->data_off  = 0x50;
+        echo->data      = rte_malloc(NULL, payload_len, 0);
+        if (!echo->data) { rte_free(echo); return -1; }
+        rte_memcpy(echo->data, payload, payload_len);
+        echo->length    = payload_len;
+
+        // enqueue
+        rte_ring_mp_enqueue(stream->sndbuf, echo);
+
+        // 推进发送序号
+        stream->snd_nxt += payload_len;
+    }
+
+    return 0;
 }
+
+
 
 struct rte_mbuf*
 encode_tcp_app_pktbuf(struct rte_mempool *mbuf_pool,
@@ -735,7 +785,7 @@ TCP_OUT(struct rte_mempool *mbuf_pool) {
 				iter->sport, iter->dport, iter->localmac, dstmac, fragment);
 			struct inout_ring *ring = ring_instance();
 			rte_ring_mp_enqueue_burst(ring->out, (void **)&tcp_mbuf, 1, NULL);
-
+			if (fragment->data != NULL) rte_free(fragment->data);
 			rte_free(fragment);
 		}
 	}
@@ -772,6 +822,7 @@ TCP_process(struct rte_mbuf *tcpmbuf) {
 	}
 
 	printf("==> TCP_process: flags=0x%02x, status=%d\n", tcp_hdr->tcp_flags, stream->status);
+	int tcplen = ntohs(ip_hdr->total_length) - sizeof (struct rte_ipv4_hdr);
 
 	switch (stream->status) {
 		case TCP_STATUS_CLOSED:
@@ -782,14 +833,15 @@ TCP_process(struct rte_mbuf *tcpmbuf) {
 			break;
 		
 		case TCP_STATUS_SYN_RCVD:
-			tcp_handle_syn_rcvd(stream, tcp_hdr);
+			tcp_handle_syn_rcvd(stream, tcp_hdr, tcplen);
 			break;
 		
 		case TCP_STATUS_SYN_SENT:
 			break;
 
 		case TCP_STATUS_ESTABLISHED:
-			tcp_handle_established(stream, tcp_hdr);
+
+			tcp_handle_established(stream, tcp_hdr, tcplen);
 			break;
 		
 		case TCP_STATUS_FIN_WAIT_1:
