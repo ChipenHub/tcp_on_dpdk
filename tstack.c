@@ -51,6 +51,93 @@ static uint16_t gDstPort;
 
 static struct rte_mempool *mbuf_pool = NULL;
 
+
+#if ENABLE_TCP_APP
+typedef enum TCP_STATUS {
+	TCP_STATUS_CLOSED = 0,
+	TCP_STATUS_LISTEN,
+	TCP_STATUS_SYN_RCVD,
+	TCP_STATUS_SYN_SENT,
+	TCP_STATUS_ESTABLISHED,
+
+	TCP_STATUS_FIN_WAIT_1,
+	TCP_STATUS_FIN_WAIT_2,
+	TCP_STATUS_CLOSING,
+	TCP_STATUS_TIME_WAIT,
+
+	TCP_STATUS_CLOSE_WAIT,
+	TCP_STATUS_LAST_ACK
+
+} TCP_STATUS;
+
+struct tcp_stream {
+/*
+int fd;
+uint32_t localip;
+uint8_t localmac[RTE_ETHER_ADDR_LEN];
+uint16_t localport;
+int protocol;
+
+*/
+
+
+	int fd;
+
+	uint32_t dip;
+
+
+	uint8_t localmac[RTE_ETHER_ADDR_LEN];
+	uint16_t dport;
+
+	uint16_t proto;
+
+	uint32_t sip;
+
+
+
+
+	uint16_t sport;
+
+
+
+
+	struct rte_ring *sndbuf;
+	struct rte_ring *rcvbuf;
+
+	struct tcp_stream *prev;
+	struct tcp_stream *next;
+
+	TCP_STATUS status;
+	
+	uint32_t snd_nxt; // seqnum
+	uint32_t rcv_nxt; // acknum
+};
+
+struct tcp_fragment {
+	rte_be16_t sport; /**< TCP source port. */
+	rte_be16_t dport; /**< TCP destination port. */
+	rte_be32_t sent_seq; /**< TX data sequence number. */
+	rte_be32_t recv_ack; /**< RX data acknowledgment sequence number. */
+	uint8_t  data_off;   /**< Data offset. */
+	uint8_t  tcp_flags;  /**< TCP flags */
+	rte_be16_t rx_win;   /**< RX flow control window. */
+	rte_be16_t cksum;    /**< TCP checksum. */
+	rte_be16_t tcp_urp;  /**< TCP urgent pointer, if any. */
+
+	int optlen;
+	uint32_t option[TCP_OPTIONAL_LENGTH];
+
+	unsigned char *data;
+	int length;
+};
+
+struct tcp_table {
+	int count;
+	struct tcp_stream *tcp_set;
+};
+
+#endif
+
 struct localhost {
 	int fd;
 	uint32_t localip;
@@ -117,12 +204,31 @@ int get_fd_from_bitmap() {
 	return ++fd_counter;
 }
 
-struct localhost *
+void *
 get_hostinfo_from_fd(int sockfd) {
 	struct localhost *host;
 	for (host = lhost; host != NULL; host = host->next)
 		if (sockfd == host->fd)
 			return host;
+
+#if ENABLE_TCP_APP
+
+	struct tcp_stream *iter;
+	struct tcp_table *table;
+	for (iter = table->tcp_set; iter != NULL; iter = iter->next) {
+
+		if (sockfd == iter->fd) {
+			
+			return iter;
+		
+		}
+
+	}
+
+#endif
+
+
+		
 	return NULL;
 }
 
@@ -421,71 +527,6 @@ TCP: Received data, sending ACK
 
 #if ENABLE_TCP_APP
 
-typedef enum TCP_STATUS {
-	TCP_STATUS_CLOSED = 0,
-	TCP_STATUS_LISTEN,
-	TCP_STATUS_SYN_RCVD,
-	TCP_STATUS_SYN_SENT,
-	TCP_STATUS_ESTABLISHED,
-
-	TCP_STATUS_FIN_WAIT_1,
-	TCP_STATUS_FIN_WAIT_2,
-	TCP_STATUS_CLOSING,
-	TCP_STATUS_TIME_WAIT,
-
-	TCP_STATUS_CLOSE_WAIT,
-	TCP_STATUS_LAST_ACK
-
-} TCP_STATUS;
-
-struct tcp_stream {
-	int fd;
-
-	uint32_t sip;
-	uint32_t dip;
-
-	uint16_t sport;
-	uint16_t dport;
-
-	uint16_t proto;
-
-	uint8_t localmac[RTE_ETHER_ADDR_LEN];
-
-	struct rte_ring *sndbuf;
-	struct rte_ring *rcvbuf;
-
-	struct tcp_stream *prev;
-	struct tcp_stream *next;
-
-	TCP_STATUS status;
-	
-	uint32_t snd_nxt; // seqnum
-	uint32_t rcv_nxt; // acknum
-};
-
-struct tcp_fragment {
-	rte_be16_t sport; /**< TCP source port. */
-	rte_be16_t dport; /**< TCP destination port. */
-	rte_be32_t sent_seq; /**< TX data sequence number. */
-	rte_be32_t recv_ack; /**< RX data acknowledgment sequence number. */
-	uint8_t  data_off;   /**< Data offset. */
-	uint8_t  tcp_flags;  /**< TCP flags */
-	rte_be16_t rx_win;   /**< RX flow control window. */
-	rte_be16_t cksum;    /**< TCP checksum. */
-	rte_be16_t tcp_urp;  /**< TCP urgent pointer, if any. */
-
-	int optlen;
-	uint32_t option[TCP_OPTIONAL_LENGTH];
-
-	unsigned char *data;
-	int length;
-};
-
-struct tcp_table {
-	int count;
-	struct tcp_stream *tcp_set;
-};
-
 static struct tcp_table *tInst = NULL;
 static struct tcp_table *tcp_instance() {
 	if (tInst == NULL) {
@@ -494,6 +535,7 @@ static struct tcp_table *tcp_instance() {
 	}
 	return tInst;	
 }
+
 
 static struct tcp_stream*
 tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
@@ -505,6 +547,17 @@ tcp_stream_search(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
 			return iter;
 		}
 	}
+
+	for (iter = table->tcp_set; iter != NULL; iter = iter->next) {
+
+		if (iter->dport == dport && iter->status == TCP_STATUS_LISTEN) {
+
+			return iter;
+			
+		}
+	
+	}
+	
 	return NULL;
 }
 
@@ -550,7 +603,7 @@ tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
 }
 
 static int
-tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
+tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr, struct rte_ipv4_hdr *ip_hdr) {
 	if (tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) {
 		if (stream->status == TCP_STATUS_LISTEN) {
 			
@@ -561,7 +614,6 @@ tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
 
 			memset(fragment, 0, sizeof (struct tcp_fragment));
 			
-			// 修复端口设置：回复时源端口和目标端口要交换
 			fragment->sport = tcp_hdr->dst_port;
 			fragment->dport = tcp_hdr->src_port;
 
@@ -589,7 +641,7 @@ tcp_handle_listen(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
 }
 
 static int
-tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr, int tcplen) {
+tcp_handle_syn_rcvd(struct tcp_stream *stream, struct rte_tcp_hdr *tcp_hdr) {
 	if (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) {
 		if (stream->status == TCP_STATUS_SYN_RCVD) {
 			uint32_t ack_num = ntohl(tcp_hdr->recv_ack);
@@ -810,15 +862,21 @@ TCP_process(struct rte_mbuf *tcpmbuf) {
 		return -1;
 	}
 
-	struct tcp_stream *stream = tcp_stream_search(ip_hdr->src_addr, ip_hdr->dst_addr,
+	struct tcp_stream *stream = tcp_stream_search(ip_hdr->src_addr, ip_hdr->dst_addr,	// established
 		tcp_hdr->src_port, tcp_hdr->dst_port);
 
+	
+
 	if (stream == NULL) {
+	/*
 		stream = tcp_stream_create(ip_hdr->src_addr, ip_hdr->dst_addr, tcp_hdr->src_port, tcp_hdr->dst_port);		
 		if (stream == NULL) {
 			rte_pktmbuf_free(tcpmbuf);
 			return -2;
 		}
+
+	*/
+	return -2;
 	}
 
 	printf("==> TCP_process: flags=0x%02x, status=%d\n", tcp_hdr->tcp_flags, stream->status);
@@ -833,7 +891,7 @@ TCP_process(struct rte_mbuf *tcpmbuf) {
 			break;
 		
 		case TCP_STATUS_SYN_RCVD:
-			tcp_handle_syn_rcvd(stream, tcp_hdr, tcplen);
+			tcp_handle_syn_rcvd(stream, tcp_hdr, ip_hdr);
 			break;
 		
 		case TCP_STATUS_SYN_SENT:
@@ -1079,59 +1137,88 @@ packet_process(__rte_unused void *arg)
 #if ENABLE_UDP_APP
 static int nsocket(int domain, int type, int protocol) {
 	int fd = get_fd_from_bitmap();
-
-	struct localhost *host = rte_malloc("localhost", sizeof (struct localhost), 0);
-	if (host == NULL) { return -1; }
-	memset(host, 0, sizeof (struct localhost));
-
-	host->fd = fd;
 	
-	if (type == SOCK_DGRAM)
+	if (type == SOCK_DGRAM) {
+
+		struct localhost *host = rte_malloc("localhost", sizeof (struct localhost), 0);
+		if (host == NULL) { return -1; }
+		memset(host, 0, sizeof (struct localhost));
+
+		host->fd = fd;
 		host->protocol = IPPROTO_UDP;
-	else if (type == SOCK_STREAM)
-		host->protocol = IPPROTO_TCP;
+		
+		char ring_name[32];
+		snprintf(ring_name, sizeof(ring_name), "rcvbuf_%d", fd);
+		host->rcvbuf = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (host->rcvbuf == NULL) {
+			rte_free(host);
+			return -1;
+		}
 
-	char ring_name[32];
-	snprintf(ring_name, sizeof(ring_name), "rcvbuf_%d", fd);
-	host->rcvbuf = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-	if (host->rcvbuf == NULL) {
-		rte_free(host);
-		return -1;
+		snprintf(ring_name, sizeof(ring_name), "sndbuf_%d", fd);
+		host->sndbuf = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+		if (host->sndbuf == NULL) {
+			rte_ring_free(host->rcvbuf);
+			rte_free(host);
+			return -1;
+		}
+
+		pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+		rte_memcpy(&host->cond, &blank_cond, sizeof (pthread_cond_t));
+
+		pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+		rte_memcpy(&host->mutex, &blank_mutex, sizeof (pthread_mutex_t));
+
+
+		
+		LL_ADD(host, lhost);
+
+	}
+	else if (type == SOCK_STREAM) {
+
+		struct tcp_stream *stream = rte_malloc("tcp_stream", sizeof (struct tcp_stream), 0);
+		if (stream == NULL) { return -1; }
+		memset(stream, 0, sizeof (struct tcp_stream));
+
+		stream->fd = fd;
+		stream->proto = IPPROTO_TCP;
+		stream->next = stream->prev = NULL;
+
+		struct tcp_table *table = tcp_instance();
+		LL_ADD(stream, table->tcp_set);
+
 	}
 
-	snprintf(ring_name, sizeof(ring_name), "sndbuf_%d", fd);
-	host->sndbuf = rte_ring_create(ring_name, RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-	if (host->sndbuf == NULL) {
-		rte_ring_free(host->rcvbuf);
-		rte_free(host);
-		return -1;
-	}
 
-	pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
-	rte_memcpy(&host->cond, &blank_cond, sizeof (pthread_cond_t));
-
-	pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
-	rte_memcpy(&host->mutex, &blank_mutex, sizeof (pthread_mutex_t));
-	
-	// 使用新版本DPDK的LL_ADD宏
-	host->prev = NULL;
-	host->next = lhost;
-	if (lhost != NULL) lhost->prev = host;
-	lhost = host;
 
 	return fd;
 }
 
 static int nbind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-	struct localhost *host = get_hostinfo_from_fd(sockfd);
-	if (host == NULL) return -1;
+	void *hostinfo = get_hostinfo_from_fd(sockfd);
+	if (hostinfo == NULL) return -1;
 
+	struct localhost *host = (struct localhost *)hostinfo;
 	struct sockaddr_in *laddr = (struct sockaddr_in *)addr;
 
-	host->localport = laddr->sin_port;
-	rte_memcpy(&host->localip, &laddr->sin_addr.s_addr, sizeof (uint32_t));
-	rte_memcpy(host->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+	if (host->protocol == IPPROTO_UDP) {
+		
+		host->localport = laddr->sin_port;
+		rte_memcpy(&host->localip, &laddr->sin_addr.s_addr, sizeof (uint32_t));
+		rte_memcpy(host->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+		
+	} else if (host->protocol == IPPROTO_TCP) {
 
+		struct tcp_stream *stream = (struct tcp_stream *)hostinfo;
+
+		stream->dport = laddr->sin_port;
+		rte_memcpy(&stream->dip, &laddr->sin_addr.s_addr, sizeof (uint32_t));
+		rte_memcpy(stream->localmac, gSrcMac, RTE_ETHER_ADDR_LEN);
+
+		stream->status = TCP_STATUS_CLOSED;
+
+
+	}
 	return 0;
 }
 
@@ -1263,6 +1350,90 @@ int udp_server_entry(void *argv) {
 	return 0;
 }
 #endif
+
+#if ENABLE_TCP_APP
+
+int nlisten(int sockfd, __attribute__((unused)) int backlog) {
+
+	void *hostinfo = get_hostinfo_from_fd(sockfd);
+	if (hostinfo == NULL) return -1;
+	struct tcp_stream *stream = (struct tcp_stream *)hostinfo;
+	if (stream->proto == IPPROTO_TCP) {
+
+		stream->status = TCP_STATUS_LISTEN;
+
+	}
+
+	return 0;
+
+}
+
+
+int naccept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+
+	
+
+}
+
+ssize_t nsend(int sockfd, const void *buf, size_t len, int flags) {
+
+	
+
+
+}
+
+ssize_t nrecv(int sockfd, const void *buf, size_t len, int flags) {
+
+
+}
+
+#endif
+
+#define BUFFER_SIZE		1024
+static int
+tcp_server_entry(void* arg) {
+
+	int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (listenfd == -1) {
+		return -1;
+	}
+
+	struct sockaddr_in servaddr;
+	memset(&servaddr, 0, sizeof (struct sockaddr_in));
+	servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_port = htons(8888);
+	
+	bind(listenfd, (struct sockaddr *)&servaddr, sizeof (struct sockaddr));
+
+	listen(listenfd, 10);
+	struct sockaddr_in clientaddr;
+
+	socklen_t len = sizeof (struct sockaddr_in);
+	int connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &len);
+
+	char buffer[BUFFER_SIZE] = { 0 };
+	while (1) {
+
+		int nb_rcv = recv(connfd, buffer, BUFFER_SIZE, 0);
+		if (nb_rcv > 0) {
+
+			send(connfd, buffer, nb_rcv, 0);
+
+		} else if (nb_rcv == 0) {
+			close(connfd);
+		} else { // nonblock
+
+
+		}
+
+	}
+	close(listenfd);
+	
+}
+
+
+
 
 int main(int argc, char *argv[]) {
     int ret;
