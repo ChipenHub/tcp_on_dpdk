@@ -1,3 +1,0 @@
-/home/chipenCode/tcp_stack/build/CMakeFiles/ustack.dir
-/home/chipenCode/tcp_stack/build/CMakeFiles/edit_cache.dir
-/home/chipenCode/tcp_stack/build/CMakeFiles/rebuild_cache.dir
